@@ -5,15 +5,15 @@ import { z } from "zod";
 import fs from 'fs/promises';
 import { homedir } from 'os';
 import path from 'path';
-import sharp from 'sharp'; // Sharp 모듈 추가
+import sharp from 'sharp';
 
 const server = new McpServer({
     name: "ImageReader",
-    version: "1.0.0"
+    version: "1.0.8"
 });
 
-// 최대 파일 크기 상수 (1MB = 1048576 bytes)
-const MAX_SIZE = 1048576;
+const MAX_SIZE = 1048576; // 1MB
+const MAX_DIMENSION = 1280; // 최대 폭/높이
 
 server.tool(
     "read_image", // Tool 이름
@@ -34,55 +34,66 @@ server.tool(
             // 파일 확장자 추출 및 MIME 타입 결정
             const extension = path.extname(absolutePath).toLowerCase();
             let mimeType = "image/jpeg"; // 기본값
+            if (extension === '.png') mimeType = "image/png";
+            else if (extension === '.jpg' || extension === '.jpeg') mimeType = "image/jpeg";
 
-            if (extension === '.png') {
-                mimeType = "image/png";
-            } else if (extension === '.jpg' || extension === '.jpeg') {
-                mimeType = "image/jpeg";
-            }
-
-            // Sharp를 사용한 이미지 처리
+            // Sharp로 메타데이터 확인
             let sharpImage = sharp(imageBuffer);
             let metadata = await sharpImage.metadata();
-            let resizedBuffer = imageBuffer;
+            let processedBuffer = imageBuffer;
 
-            // 파일 크기가 1MB를 초과하는 경우 리사이징
-            if (imageBuffer.length > MAX_SIZE) {
-                let quality = 80; // 초기 품질 설정
-                let scaleFactor = 0.9; // 크기 조절 비율
+            // 크기 조정 필요 여부 확인
+            if (metadata.width > MAX_DIMENSION || metadata.height > MAX_DIMENSION || imageBuffer.length > MAX_SIZE) {
+                // 먼저 1280px 제한에 맞게 리사이즈
+                sharpImage = sharp(imageBuffer).resize({
+                    width: MAX_DIMENSION,
+                    height: MAX_DIMENSION,
+                    fit: 'inside', // 비율 유지
+                    withoutEnlargement: true // 확대 방지
+                });
 
-                do {
-                    // 이미지 리사이징 및 품질 조정
-                    sharpImage = sharp(imageBuffer)
-                        .resize({
-                            width: Math.round(metadata.width * scaleFactor),
-                            height: Math.round(metadata.height * scaleFactor),
-                        });
+                processedBuffer = await sharpImage.toBuffer();
 
-                    // MIME 타입에 따라 적절한 압축 적용
+                // 여전히 1MB를 초과하는 경우
+                if (processedBuffer.length > MAX_SIZE) {
                     if (mimeType === 'image/jpeg') {
-                        resizedBuffer = await sharpImage
-                            .jpeg({ quality })
-                            .toBuffer();
+                        // JPG: 품질 조절
+                        let quality = 80;
+                        do {
+                            processedBuffer = await sharpImage
+                                .jpeg({ quality })
+                                .toBuffer();
+                            quality -= 10;
+                            if (quality <= 10) break;
+                        } while (processedBuffer.length > MAX_SIZE);
                     } else if (mimeType === 'image/png') {
-                        resizedBuffer = await sharpImage
-                            .png({ quality: Math.round(quality * 0.9) }) // PNG는 0-9 스케일
-                            .toBuffer();
+                        // PNG: 10%씩 해상도 축소
+                        let scaleFactor = 0.9;
+                        let currentWidth = Math.min(metadata.width, MAX_DIMENSION);
+                        let currentHeight = Math.min(metadata.height, MAX_DIMENSION);
+
+                        do {
+                            currentWidth = Math.round(currentWidth * scaleFactor);
+                            currentHeight = Math.round(currentHeight * scaleFactor);
+
+                            processedBuffer = await sharp(imageBuffer)
+                                .resize({
+                                    width: currentWidth,
+                                    height: currentHeight,
+                                    fit: 'inside'
+                                })
+                                .png()
+                                .toBuffer();
+
+                            scaleFactor *= 0.9;
+                            if (currentWidth <= 100 || currentHeight <= 100) break; // 최소 크기 제한
+                        } while (processedBuffer.length > MAX_SIZE);
                     }
-
-                    // 다음 반복을 위한 조정
-                    if (resizedBuffer.length > MAX_SIZE) {
-                        quality -= 10; // 품질 감소
-                        scaleFactor *= 0.9; // 크기 추가 축소
-                    }
-
-                    if (quality <= 10) break; // 최소 품질 도달 시 중단
-
-                } while (resizedBuffer.length > MAX_SIZE);
+                }
             }
 
             // Base64로 인코딩
-            const base64Image = resizedBuffer.toString('base64');
+            const base64Image = processedBuffer.toString('base64');
 
             // 결과 반환
             return {
@@ -93,7 +104,6 @@ server.tool(
                 }]
             };
         } catch (error) {
-            // 에러 처리
             return {
                 content: [{
                     type: "text",
